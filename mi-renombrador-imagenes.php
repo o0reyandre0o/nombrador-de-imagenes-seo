@@ -826,14 +826,21 @@ function mri_procesar_imagen_subida_google_ai($attachment_id, $is_bulk_process =
 
     // Si la imagen fue renombrada o comprimida (y no es SVG), los metadatos deben regenerarse.
     if (($new_file_path || $was_compressed) && strpos($mime_type, 'svg') === false) {
-        // Borrar metadatos antiguos para evitar conflictos.
-        wp_delete_attachment_metadata($attachment_id);
-
-        // Regenerar metadatos desde el archivo final.
         require_once(ABSPATH . 'wp-admin/includes/image.php');
+
+        // Es crucial que wp_generate_attachment_metadata lea del archivo correcto.
         $new_metadata = wp_generate_attachment_metadata($attachment_id, $final_file_path);
-        wp_update_attachment_metadata($attachment_id, $new_metadata);
-        $log_summary[] = __('Metadatos regenerados.', 'mi-renombrador-imagenes');
+
+        // Si la generación de metadatos falla, $new_metadata será un array vacío o un WP_Error.
+        if (is_wp_error($new_metadata) || empty($new_metadata)) {
+            error_log("MRI Plugin: Fallo al generar metadatos para ID $attachment_id en la ruta $final_file_path.");
+            $log_summary[] = __('Fallo en la regeneración de metadatos.', 'mi-renombrador-imagenes');
+        } else {
+            // Solo si los metadatos son válidos, los actualizamos.
+            // wp_update_attachment_metadata es más seguro que wp_delete_attachment_metadata + update_post_meta.
+            wp_update_attachment_metadata($attachment_id, $new_metadata);
+            $log_summary[] = __('Metadatos regenerados.', 'mi-renombrador-imagenes');
+        }
     }
 
     // Cargar imagen en base64 solo si es necesario para Alt o Caption
@@ -1038,124 +1045,11 @@ function mri_rename_image_file($attachment_id, $file_path, $title, $context, $op
  * @return bool True si la imagen fue comprimida, false en caso contrario.
  */
 function mri_compress_image($attachment_id, $file_path, $mime_type, $options, &$log_summary) {
-    $compressible_types = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif'];
-    if (!$options['enable_compression'] || !in_array($mime_type, $compressible_types, true)) {
-        return false;
+    // Temporalmente desactivado para depuración
+    if ($options['enable_compression']) {
+         $log_summary[] = __('Compresión temporalmente desactivada para depuración.', 'mi-renombrador-imagenes');
     }
-
-    if (!is_writable($file_path)) {
-        $log_summary[] = __('Compresión omitida: archivo no escribible.', 'mi-renombrador-imagenes');
-        error_log("MRI Plugin: Compression skipped for ID $attachment_id, file not writable: $file_path");
-        return false;
-    }
-
-    $original_size = @filesize($file_path);
-    if (!$original_size) {
-        $log_summary[] = __('Compresión omitida: no se pudo obtener tamaño original.', 'mi-renombrador-imagenes');
-        return false;
-    }
-
-    $use_imagick = $options['use_imagick_if_available'] && extension_loaded('imagick') && class_exists('Imagick');
-    $compressed = false;
-
-    if ($use_imagick) {
-        try {
-            $imagick = new Imagick($file_path);
-            $format = $imagick->getImageFormat();
-
-            switch ($format) {
-                case 'JPEG':
-                    $imagick->setImageCompression(Imagick::COMPRESSION_JPEG);
-                    $imagick->setImageCompressionQuality($options['jpeg_quality']);
-                    break;
-                case 'PNG':
-                    $imagick->setImageCompression(Imagick::COMPRESSION_ZIP);
-                    $imagick->setImageCompressionQuality(9);
-                    break;
-                case 'GIF':
-                    $imagick = $imagick->optimizeImageLayers();
-                    break;
-                case 'WEBP':
-                    $imagick->setImageFormat('WEBP');
-                    $imagick->setImageCompressionQuality($options['jpeg_quality']);
-                    break;
-                case 'AVIF':
-                     $imagick->setImageFormat('AVIF');
-                     $imagick->setImageCompressionQuality($options['jpeg_quality']);
-                     break;
-            }
-
-            $imagick->stripImage();
-            if ($imagick->writeImage($file_path)) {
-                $compressed = true;
-            } else {
-                $log_summary[] = __('Fallo compresión Imagick (write).', 'mi-renombrador-imagenes');
-            }
-            $imagick->clear();
-            $imagick->destroy();
-        } catch (ImagickException $e) {
-            $log_summary[] = sprintf(__('Error Imagick: %s', 'mi-renombrador-imagenes'), $e->getMessage());
-            error_log("MRI Plugin Imagick Error ID $attachment_id: " . $e->getMessage());
-        }
-    } elseif (extension_loaded('gd')) {
-        // Fallback a GD
-        ini_set('memory_limit', '256M');
-        $image_resource = null;
-
-        switch ($mime_type) {
-            case 'image/jpeg':
-                $image_resource = @imagecreatefromjpeg($file_path);
-                if ($image_resource && @imagejpeg($image_resource, $file_path, $options['jpeg_quality'])) {
-                    $compressed = true;
-                }
-                break;
-            case 'image/png':
-                $image_resource = @imagecreatefrompng($file_path);
-                if ($image_resource) {
-                    imagealphablending($image_resource, false);
-                    imagesavealpha($image_resource, true);
-                    if (@imagepng($image_resource, $file_path, 9)) {
-                        $compressed = true;
-                    }
-                }
-                break;
-            case 'image/gif':
-                $image_resource = @imagecreatefromgif($file_path);
-                if ($image_resource && @imagegif($image_resource, $file_path)) {
-                    $compressed = true;
-                }
-                break;
-            case 'image/webp':
-                 $image_resource = @imagecreatefromwebp($file_path);
-                 if ($image_resource && @imagewebp($image_resource, $file_path, $options['jpeg_quality'])) {
-                     $compressed = true;
-                 }
-                 break;
-        }
-
-        if ($image_resource) {
-            imagedestroy($image_resource);
-        }
-        if (!$compressed) {
-            $log_summary[] = __('Fallo compresión GD.', 'mi-renombrador-imagenes');
-        }
-    } else {
-        $log_summary[] = __('Compresión omitida: no hay librerías (Imagick/GD).', 'mi-renombrador-imagenes');
-        return false;
-    }
-
-    if ($compressed) {
-        clearstatcache();
-        $new_size = @filesize($file_path);
-        if ($new_size && $new_size < $original_size) {
-            $reduction = round((1 - $new_size / $original_size) * 100);
-            $log_summary[] = sprintf(__('Comprimido (%d%% red.).', 'mi-renombrador-imagenes'), $reduction);
-        } else {
-            $log_summary[] = __('Comprimido (sin reducción).', 'mi-renombrador-imagenes');
-        }
-    }
-
-    return $compressed;
+    return false;
 }
 
 /**
